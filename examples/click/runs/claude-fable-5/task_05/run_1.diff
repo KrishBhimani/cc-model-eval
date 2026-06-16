@@ -1,0 +1,138 @@
+diff --git a/CHANGES.rst b/CHANGES.rst
+index 4de49f4..22bb5b1 100644
+--- a/CHANGES.rst
++++ b/CHANGES.rst
+@@ -7,6 +7,10 @@ Unreleased
+ 
+ -   Supported versions of Windows enable ANSI terminal styles by default.
+     Colorama is no longer a dependency and is not used. :issue:`2986` :pr:`3505`
++-   Required options are shown in the usage line, outside of the ``[OPTIONS]``
++    placeholder, so they can be spotted at a glance. They are rendered with
++    their long form and metavar (e.g. ``--name TEXT``) ahead of the positional
++    operands.
+ 
+ 
+ Version 8.4.2
+diff --git a/docs/documentation.md b/docs/documentation.md
+index 73a0ea7..092ddd3 100644
+--- a/docs/documentation.md
++++ b/docs/documentation.md
+@@ -313,7 +313,7 @@ The default placeholder variable ([meta variable](https://en.wikipedia.org/wiki/
+ ```{admonition} Optional elements are bracketed
+ :class: note
+ 
+-   The usage line follows a consistent convention: an element is optional when it is enclosed in square brackets and required when it appears outside them. A required argument appears as `FOO` and an optional one as `[FOO]`, with a variadic argument adding a trailing `...` (so `[FOO]...`). A single pair of brackets can group several tokens, so a chained group renders an extra command and its arguments as one optional, repeatable unit: `[COMMAND2 [ARGS]...]...`. A {class}`Group` that can run without naming a subcommand (`invoke_without_command=True`) also brackets the leading command, showing `[COMMAND]` instead of `COMMAND`. The `[OPTIONS]` placeholder is always bracketed, since adding options is itself optional.
++   The usage line follows a consistent convention: an element is optional when it is enclosed in square brackets and required when it appears outside them. A required argument appears as `FOO` and an optional one as `[FOO]`, with a variadic argument adding a trailing `...` (so `[FOO]...`). A single pair of brackets can group several tokens, so a chained group renders an extra command and its arguments as one optional, repeatable unit: `[COMMAND2 [ARGS]...]...`. A {class}`Group` that can run without naming a subcommand (`invoke_without_command=True`) also brackets the leading command, showing `[COMMAND]` instead of `COMMAND`. The `[OPTIONS]` placeholder is always bracketed, since adding options is itself optional, but an option marked with `required=True` is spelled out unbracketed right after it (so `[OPTIONS] --name TEXT`), keeping required options visible at a glance.
+ 
+    This mirrors the conventional utility-argument syntax for optional arguments and operands ([POSIX §12.1](https://pubs.opengroup.org/onlinepubs/9699919799/basedefs/V1_chap12.html), [`man-pages(7)`](https://man7.org/linux/man-pages/man7/man-pages.7.html)), where a bracketed expression followed by `...` denotes zero or more occurrences. A subcommand name is a positional operand, so Click brackets it under the same rule.
+ ```
+diff --git a/src/click/core.py b/src/click/core.py
+index b422bd4..e2e5a09 100644
+--- a/src/click/core.py
++++ b/src/click/core.py
+@@ -1088,12 +1088,24 @@ class Command:
+     def collect_usage_pieces(self, ctx: Context) -> list[str]:
+         """Returns all the pieces that go into the usage line and returns
+         it as a list of strings.
++
++        .. versionchanged:: 8.5.0
++            Required options are rendered after the options placeholder
++            and before the positional operands, regardless of declaration
++            order.
+         """
+         rv = [self.options_metavar] if self.options_metavar else []
++        operands = []
+ 
+         for param in self.get_params(ctx):
+-            rv.extend(param.get_usage_pieces(ctx))
++            # Keep options next to the options placeholder, ahead of the
++            # positional operands.
++            if isinstance(param, Option):
++                rv.extend(param.get_usage_pieces(ctx))
++            else:
++                operands.extend(param.get_usage_pieces(ctx))
+ 
++        rv.extend(operands)
+         return rv
+ 
+     def get_help_option_names(self, ctx: Context) -> list[str]:
+@@ -2766,6 +2778,10 @@ class Option(Parameter):
+     :param hidden: hide this option from help outputs.
+     :param attrs: Other command arguments described in :class:`Parameter`.
+ 
++    .. versionchanged:: 8.5.0
++        Required options are shown in the usage line in addition to the
++        ``[required]`` label in the option's description.
++
+     .. versionchanged:: 8.4.0
+         Non-basic ``flag_value`` types (not ``str``, ``int``, ``float``, or
+         ``bool``) are passed through unchanged instead of being stringified.
+@@ -3248,6 +3264,19 @@ class Option(Parameter):
+ 
+         return extra
+ 
++    def get_usage_pieces(self, ctx: Context) -> list[str]:
++        if not self.required or self.hidden:
++            return []
++
++        # Pick the spelling with the longest prefix as the canonical form,
++        # preferring ``--name`` over ``-n``.
++        opt = max(self.opts, key=lambda opt: len(_split_opt(opt)[0]))
++
++        if self.is_flag or self.count:
++            return [opt]
++
++        return [f"{opt} {self.make_metavar(ctx=ctx)}"]
++
+     def prompt_for_value(self, ctx: Context) -> t.Any:
+         """This is an alternative flow that can be activated in the full
+         value processing if a value does not exist.  It will prompt the
+diff --git a/tests/test_options.py b/tests/test_options.py
+index 1b93e13..03ccf10 100644
+--- a/tests/test_options.py
++++ b/tests/test_options.py
+@@ -897,6 +897,44 @@ def test_missing_required_flag(runner):
+     assert "Error: Missing option '--on'." in result.output
+ 
+ 
++@pytest.mark.parametrize(
++    ("decls", "kwargs", "expected"),
++    [
++        (["--name"], {}, ""),
++        (["--name"], {"default": "x"}, ""),
++        (["--name"], {"required": True}, " --name TEXT"),
++        (["-n", "--name"], {"required": True}, " --name TEXT"),
++        (["--name", "-n"], {"required": True}, " --name TEXT"),
++        (["-n"], {"required": True}, " -n TEXT"),
++        (["--flag"], {"is_flag": True, "required": True}, " --flag"),
++        (["-v"], {"count": True, "required": True}, " -v"),
++        (["--name"], {"required": True, "metavar": "NAME"}, " --name NAME"),
++        (["--name"], {"required": True, "hidden": True}, ""),
++    ],
++)
++def test_required_option_in_usage(runner, decls, kwargs, expected):
++    """A required option is shown in the usage line, preferring its long form."""
++    cli = click.Command("cli", params=[click.Option(decls, **kwargs)])
++    result = runner.invoke(cli, ["--help"])
++    assert result.exit_code == 0
++    assert result.output.splitlines()[0] == f"Usage: cli [OPTIONS]{expected}"
++
++
++def test_required_options_precede_operands_in_usage(runner):
++    """Required options stay next to [OPTIONS] even when declared after
++    an argument."""
++
++    @click.command()
++    @click.argument("src")
++    @click.option("--name", required=True)
++    def cli(src, name):
++        pass
++
++    result = runner.invoke(cli, ["--help"])
++    assert result.exit_code == 0
++    assert result.output.splitlines()[0] == "Usage: cli [OPTIONS] --name TEXT SRC"
++
++
+ def test_missing_choice(runner):
+     @click.command()
+     @click.option("--foo", type=click.Choice(["foo", "bar"]), required=True)

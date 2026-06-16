@@ -1,0 +1,113 @@
+diff --git a/CHANGES.rst b/CHANGES.rst
+index 4de49f4..dc97440 100644
+--- a/CHANGES.rst
++++ b/CHANGES.rst
+@@ -7,6 +7,9 @@ Unreleased
+ 
+ -   Supported versions of Windows enable ANSI terminal styles by default.
+     Colorama is no longer a dependency and is not used. :issue:`2986` :pr:`3505`
++-   Required options are marked with a ``*`` in the options list of the help
++    output, with a legend explaining the marker, making them easy to spot at a
++    glance. The redundant inline ``[required]`` label is no longer shown.
+ 
+ 
+ Version 8.4.2
+diff --git a/src/click/core.py b/src/click/core.py
+index b422bd4..6f928dd 100644
+--- a/src/click/core.py
++++ b/src/click/core.py
+@@ -1201,14 +1201,34 @@ class Command:
+     def format_options(self, ctx: Context, formatter: HelpFormatter) -> None:
+         """Writes all the options into the formatter if they exist."""
+         opts = []
++        any_required = False
+         for param in self.get_params(ctx):
+             rv = param.get_help_record(ctx)
+             if rv is not None:
+-                opts.append(rv)
++                required = getattr(param, "required", False)
++                any_required = any_required or required
++                opts.append((required, rv))
+ 
+-        if opts:
+-            with formatter.section(_("Options")):
+-                formatter.write_dl(opts)
++        if not opts:
++            return
++
++        if any_required:
++            # Mark required options with a leading "*" so they stand out at
++            # a glance. Pad the rest by the same width to keep the option
++            # names aligned, and add a legend explaining the marker.
++            rows = [
++                (f"* {term}" if required else f"  {term}", help)
++                for required, (term, help) in opts
++            ]
++        else:
++            rows = [rv for _, rv in opts]
++
++        with formatter.section(_("Options")):
++            formatter.write_dl(rows)
++
++            if any_required:
++                formatter.write_paragraph()
++                formatter.write_text(_("Options marked with * are required."))
+ 
+     def format_epilog(self, ctx: Context, formatter: HelpFormatter) -> None:
+         """Writes the epilog into the formatter if it exists."""
+@@ -3155,8 +3175,11 @@ class Option(Parameter):
+             extra_items.append(_("default: {default}").format(default=extra["default"]))
+         if "range" in extra:
+             extra_items.append(extra["range"])
+-        if "required" in extra:
+-            extra_items.append(_(extra["required"]))
++        # "required" is intentionally omitted here: required options are
++        # flagged with a "*" marker in the options list (see
++        # ``Command.format_options``), so repeating "[required]" inline would
++        # be redundant. It is still reported by ``get_help_extra`` for
++        # programmatic use.
+ 
+         if extra_items:
+             extra_str = "; ".join(extra_items)
+diff --git a/tests/test_options.py b/tests/test_options.py
+index 1b93e13..a62189f 100644
+--- a/tests/test_options.py
++++ b/tests/test_options.py
+@@ -582,6 +582,37 @@ def test_multiple_default_help(runner):
+     assert "1, 2" in result.output
+ 
+ 
++def test_required_options_marked_in_help(runner):
++    @click.command()
++    @click.option("--name", required=True, help="The name.")
++    @click.option("--count", default=1, help="The count.")
++    def cmd(name, count):
++        pass
++
++    result = runner.invoke(cmd, ["--help"])
++    assert not result.exception
++    # Required options get a "*" marker; others are padded to stay aligned.
++    assert "* --name" in result.output
++    assert "  --count" in result.output
++    # The redundant inline "[required]" label is replaced by the marker.
++    assert "[required]" not in result.output
++    # A legend explains the marker.
++    assert "Options marked with * are required." in result.output
++
++
++def test_no_required_marker_without_required_options(runner):
++    @click.command()
++    @click.option("--count", default=1, help="The count.")
++    def cmd(count):
++        pass
++
++    result = runner.invoke(cmd, ["--help"])
++    assert not result.exception
++    # Without required options, no marker column or legend is added.
++    assert "*" not in result.output
++    assert "Options marked with * are required." not in result.output
++
++
+ def test_show_default_default_map(runner):
+     @click.command()
+     @click.option("--arg", default="a", show_default=True)

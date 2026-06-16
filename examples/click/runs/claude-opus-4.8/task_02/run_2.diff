@@ -1,0 +1,271 @@
+diff --git a/src/click/core.py b/src/click/core.py
+index b422bd4..07ce798 100644
+--- a/src/click/core.py
++++ b/src/click/core.py
+@@ -1199,12 +1199,21 @@ class Command:
+                 formatter.write_text(text)
+ 
+     def format_options(self, ctx: Context, formatter: HelpFormatter) -> None:
+-        """Writes all the options into the formatter if they exist."""
++        """Writes all the arguments and options into the formatter if they
++        exist."""
++        args = []
+         opts = []
+         for param in self.get_params(ctx):
+             rv = param.get_help_record(ctx)
+             if rv is not None:
+-                opts.append(rv)
++                if param.param_type_name == "argument":
++                    args.append(rv)
++                else:
++                    opts.append(rv)
++
++        if args:
++            with formatter.section(_("Positional arguments")):
++                formatter.write_dl(args)
+ 
+         if opts:
+             with formatter.section(_("Options")):
+@@ -2190,6 +2199,7 @@ class Parameter(ABC):
+             [Context, Parameter, str], list[CompletionItem] | list[str]
+         ]
+         | None = None,
++        help: str | None = None,
+         deprecated: bool | str = False,
+     ) -> None:
+         self.name: str
+@@ -2226,6 +2236,15 @@ class Parameter(ABC):
+         self._custom_shell_complete = shell_complete
+         self.deprecated = deprecated
+ 
++        if help:
++            help = inspect.cleandoc(help)
++
++        if deprecated:
++            label = _format_deprecated_label(deprecated)
++            help = f"{help} {label}" if help else label
++
++        self.help = help
++
+         if __debug__:
+             if self.type.is_composite and nargs != self.type.arity:
+                 raise ValueError(
+@@ -2266,6 +2285,7 @@ class Parameter(ABC):
+             # designed for documentation purposes, we return ``None`` instead.
+             "default": self.default if self.default is not UNSET else None,
+             "envvar": self.envvar,
++            "help": self.help,
+         }
+ 
+     def __repr__(self) -> str:
+@@ -2815,11 +2835,13 @@ class Option(Parameter):
+         deprecated: bool | str = False,
+         **attrs: t.Any,
+     ) -> None:
+-        if help:
+-            help = inspect.cleandoc(help)
+-
+         super().__init__(
+-            param_decls, type=type, multiple=multiple, deprecated=deprecated, **attrs
++            param_decls,
++            type=type,
++            multiple=multiple,
++            help=help,
++            deprecated=deprecated,
++            **attrs,
+         )
+ 
+         if prompt is True:
+@@ -2832,10 +2854,6 @@ class Option(Parameter):
+         else:
+             prompt_text = prompt
+ 
+-        if deprecated:
+-            label = _format_deprecated_label(deprecated)
+-            help = f"{help} {label}" if help else label
+-
+         self.prompt = prompt_text
+         self.confirmation_prompt = confirmation_prompt
+         self.prompt_required = prompt_required
+@@ -2934,7 +2952,6 @@ class Option(Parameter):
+                 self.default = 0
+ 
+         self.allow_from_autoenv = allow_from_autoenv
+-        self.help = help
+         self.show_default = show_default
+         self.show_choices = show_choices
+         self.show_envvar = show_envvar
+@@ -3517,6 +3534,12 @@ class Argument(Parameter):
+     def get_usage_pieces(self, ctx: Context) -> list[str]:
+         return [self.make_metavar(ctx)]
+ 
++    def get_help_record(self, ctx: Context) -> tuple[str, str] | None:
++        if not self.help:
++            return None
++
++        return self.make_metavar(ctx), self.help
++
+     def get_error_hint(self, ctx: Context | None) -> str:
+         if ctx is not None:
+             return f"'{self.make_metavar(ctx)}'"
+diff --git a/tests/test_arguments.py b/tests/test_arguments.py
+index 6015282..f4b4523 100644
+--- a/tests/test_arguments.py
++++ b/tests/test_arguments.py
+@@ -295,6 +295,50 @@ def test_implicit_non_required(runner):
+     assert result.output == "test\n"
+ 
+ 
++def test_argument_help(runner):
++    @click.command()
++    @click.argument("name", help="The name to print")
++    @click.option("--count", default=1, help="number of greetings")
++    def cli(name, count):
++        pass
++
++    result = runner.invoke(cli, ["--help"])
++    assert result.exit_code == 0, result.output
++    assert "Positional arguments:" in result.output
++    assert "NAME" in result.output
++    assert "The name to print" in result.output
++    assert "Options:" in result.output
++    assert "number of greetings" in result.output
++    assert result.output.index("Positional arguments:") < result.output.index(
++        "Options:"
++    )
++
++
++def test_argument_help_options_only_no_arguments_section(runner):
++    @click.command()
++    @click.option("--count", default=1, help="number of greetings")
++    def cli(count):
++        pass
++
++    result = runner.invoke(cli, ["--help"])
++    assert result.exit_code == 0, result.output
++    assert "Positional arguments:" not in result.output
++    assert "Options:" in result.output
++    assert "number of greetings" in result.output
++
++
++def test_argument_help_optional_metavar(runner):
++    @click.command()
++    @click.argument("name", required=False, default="", help="The name to print")
++    def cli(name):
++        pass
++
++    result = runner.invoke(cli, ["--help"])
++    assert result.exit_code == 0, result.output
++    assert "[NAME]" in result.output
++    assert "The name to print" in result.output
++
++
+ def test_deprecated_usage(runner):
+     @click.command()
+     @click.argument("f", required=False, deprecated=True)
+@@ -332,6 +376,50 @@ def test_argument_metavar_marks_optional(runner, kwargs, expected):
+     assert result.output.splitlines()[0] == f"Usage: cli [OPTIONS] {expected}"
+ 
+ 
++@pytest.mark.parametrize(
++    ("deprecated", "expected_label"),
++    [(True, "(DEPRECATED)"), ("use g instead", "(DEPRECATED: use g instead)")],
++)
++def test_deprecated_usage_help_record(runner, deprecated, expected_label):
++    @click.command()
++    @click.argument("f", required=False, deprecated=deprecated, help="path to the file")
++    def cli(f):
++        click.echo(f)
++
++    result = runner.invoke(cli, ["--help"])
++    assert result.exit_code == 0, result.output
++    assert "Positional arguments:" in result.output
++    assert "[F!]" in result.output
++    assert f"path to the file {expected_label}" in result.output
++
++
++def test_deprecated_usage_help_record_without_help(runner):
++    @click.command()
++    @click.argument("f", required=False, deprecated=True)
++    def cli(f):
++        click.echo(f)
++
++    result = runner.invoke(cli, ["--help"])
++    assert result.exit_code == 0, result.output
++    # Deprecation alone produces a help row with just the deprecation label.
++    assert "Positional arguments:" in result.output
++    assert "(DEPRECATED)" in result.output
++
++
++@pytest.mark.parametrize(
++    ("deprecated", "expected"),
++    [(True, "(DEPRECATED)"), ("USE B INSTEAD", "(DEPRECATED: USE B INSTEAD)")],
++)
++@pytest.mark.parametrize("help_text", ["", None])
++def test_deprecated_empty_help_no_leading_space(help_text, deprecated, expected):
++    """An argument with empty or missing help text must not gain a stray leading
++    space before the deprecation label.
++    """
++    arg = click.Argument(["foo"], required=False, help=help_text, deprecated=deprecated)
++    ctx = click.Context(click.Command("cli"))
++    assert arg.get_help_record(ctx)[1] == expected
++
++
+ @pytest.mark.parametrize("deprecated", [True, "USE B INSTEAD"])
+ def test_deprecated_warning(runner, deprecated):
+     @click.command()
+diff --git a/tests/test_info_dict.py b/tests/test_info_dict.py
+index 20fe68c..b434c3f 100644
+--- a/tests/test_info_dict.py
++++ b/tests/test_info_dict.py
+@@ -40,6 +40,7 @@ NAME_ARGUMENT = (
+         "multiple": False,
+         "default": None,
+         "envvar": None,
++        "help": None,
+     },
+ )
+ NUMBER_OPTION = (
+@@ -273,3 +274,42 @@ def test_paramtype_no_name():
+         pass
+ 
+     assert TestType().to_info_dict()["name"] == "TestType"
++
++
++@pytest.mark.parametrize(
++    ("help_in", "help_out"),
++    [
++        pytest.param(None, None, id="None"),
++        pytest.param("", "", id="empty"),
++        pytest.param("single line", "single line", id="single-line"),
++        pytest.param(
++            "\n    first line\n    second line\n    ",
++            "first line\nsecond line",
++            id="multi-line",
++        ),
++    ],
++)
++def test_argument_to_info_dict_help(help_in, help_out):
++    arg = click.Argument(["name"], help=help_in)
++    assert arg.to_info_dict()["help"] == help_out
++
++
++def test_argument_to_info_dict_nargs():
++    arg = click.Argument(["files"], nargs=-1, help="files to process")
++    info = arg.to_info_dict()
++    assert info["nargs"] == -1
++    assert info["help"] == "files to process"
++
++
++def test_command_to_info_dict_multiple_arguments():
++    @click.command()
++    @click.argument("src", help="source path")
++    @click.argument("dst", help="destination path")
++    def cli(src, dst):
++        pass
++
++    ctx = click.Context(cli)
++    params = cli.to_info_dict(ctx)["params"]
++    args = [p for p in params if p["param_type_name"] == "argument"]
++    assert [p["name"] for p in args] == ["src", "dst"]
++    assert [p["help"] for p in args] == ["source path", "destination path"]

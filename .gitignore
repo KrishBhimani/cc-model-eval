@@ -1,0 +1,11 @@
+# generated / local — not committed
+.work/
+.venv/
+# runs/
+tasks/
+__pycache__/
+*.pyc
+.DS_Store
+*.jsonl
+ARTICLE.md
+INTERNAL_WORKING.md
