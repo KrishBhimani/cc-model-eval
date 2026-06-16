@@ -1,100 +1,95 @@
 #!/usr/bin/env bash
-#
-# setup.sh — one-shot setup. Clones the target repo, builds the venv,
-# installs deps, and preps + verifies every task in config.sh.
-#
-# Usage:
-#   export GITHUB_TOKEN=ghp_...     # avoids GitHub's 60/hr unauth limit
-#   bash setup.sh
-#
+# setup.sh — clone the repo, make a venv, install, and check each task is valid.
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-source "$HERE/config.sh"
-source "$HERE/lib.sh"
+source "$HERE/config.sh"; source "$HERE/lib.sh"
 
-echo "=== cc-model-eval setup ==="
+echo "=== setup ==="
 echo "EVAL_HOME=$EVAL_HOME"
 
-# ---- prerequisites -------------------------------------------------------
-need() { command -v "$1" >/dev/null 2>&1 || { err "missing prerequisite: $1"; exit 1; }; }
-need git; need python3; need claude
-command -v node >/dev/null 2>&1 || warn "node not found — Claude Code needs Node.js"
-[[ -z "${GITHUB_TOKEN:-}" ]] && warn "GITHUB_TOKEN not set — prep may hit GitHub's 60/hr unauth limit"
-
-# ---- clone target repo ---------------------------------------------------
-if [[ -d "$WORK_REPO/.git" ]]; then
-  ok "repo already cloned at $WORK_REPO"
+# 1. clone (or reuse) the repo
+if [[ -d "$REPO_DIR/.git" ]]; then
+  ok "repo already at $REPO_DIR"
+  reset_repo
 else
-  mkdir -p "$(dirname "$WORK_REPO")"
   echo "cloning $REPO_URL ..."
-  git clone --quiet "$REPO_URL" "$WORK_REPO" || { err "clone failed"; exit 1; }
-  ok "cloned to $WORK_REPO"
+  git clone -q "$REPO_URL" "$REPO_DIR" || { err "clone failed"; exit 1; }
+  ok "cloned to $REPO_DIR"
 fi
 
-# ---- venv + deps ---------------------------------------------------------
+# 2. venv + install
 if [[ ! -d "$VENV_DIR" ]]; then
-  python3 -m venv "$VENV_DIR"; ok "created venv at $VENV_DIR"
+  python3 -m venv "$VENV_DIR" && ok "created venv"
 fi
-"$VENV_DIR/bin/pip" install --quiet --upgrade pip
-echo "installing $REPO_URL deps ($PIP_INSTALL) ..."
-if ! ( cd "$WORK_REPO" && "$VENV_DIR/bin/pip" install --quiet -e "$PIP_INSTALL" ) 2>/dev/null; then
-  warn "'$PIP_INSTALL' failed; falling back to '.' + pytest"
-  ( cd "$WORK_REPO" && "$VENV_DIR/bin/pip" install --quiet -e . && "$VENV_DIR/bin/pip" install --quiet pytest ) \
-    || { err "dependency install failed"; exit 1; }
+echo "installing ..."
+# upgrade pip — needed for modern build backends; fail loudly if it can't
+if ! "$VENV_DIR/bin/pip" install --upgrade pip >/tmp/eval_pip.log 2>&1; then
+  err "could not upgrade pip:"; tail -20 /tmp/eval_pip.log; exit 1
 fi
-ok "deps installed"
+# install the repo under test (editable). Show the error if it fails — don't swallow it.
+if ! ( cd "$REPO_DIR" && "$VENV_DIR/bin/pip" install $PIP_INSTALL ) >/tmp/eval_pip.log 2>&1; then
+  err "installing the repo ($PIP_INSTALL) failed:"; tail -30 /tmp/eval_pip.log
+  err "fix the install (often: PIP_INSTALL or a missing build dep), then re-run setup.sh"
+  exit 1
+fi
+# extra deps (pytest etc.)
+if [[ -n "$EXTRA_PIP" ]]; then
+  if ! "$VENV_DIR/bin/pip" install $EXTRA_PIP >/tmp/eval_pip.log 2>&1; then
+    err "installing EXTRA_PIP ($EXTRA_PIP) failed:"; tail -20 /tmp/eval_pip.log; exit 1
+  fi
+fi
+# Optional: verify the package imports, if the user set VERIFY_IMPORT.
+# Skipped entirely when VERIFY_IMPORT is empty (the default) so nothing is
+# assumed about which repo you're testing.
+if [[ -n "${VERIFY_IMPORT:-}" ]]; then
+  if ! "$VENV_DIR/bin/python" -c "import $VERIFY_IMPORT" 2>/tmp/eval_pip.log; then
+    err "installed, but 'import $VERIFY_IMPORT' fails — the package isn't importable:"
+    tail -20 /tmp/eval_pip.log
+    err "(check VERIFY_IMPORT in config.sh — it must match the module the repo installs as)"
+    exit 1
+  fi
+  ok "deps installed; '$VERIFY_IMPORT' imports cleanly"
+else
+  ok "deps installed"
+fi
 
-# ---- prep + verify each task --------------------------------------------
-mkdir -p "$TASKS_DIR"
+# 3. validate each task: a gated task's test must FAIL on clean code
+echo
 declare -A STATUS
-for entry in "${TASKS[@]}"; do
-  IFS='|' read -r TASK PR APPLY GATE <<< "$entry"
-  echo; echo "---- $TASK (pr=$PR) ----"
+for task_dir in "$TASKS_DIR"/*/; do
+  task="$(basename "$task_dir")"
+  gate="$(gate_of "$task")"
+  echo "---- $task ----"
 
-  if [[ "$PR" == "0" ]]; then
-    # No PR — an authored task. Two flavours:
-    #   gate=MANUAL          -> open-ended, hand/LLM scored (no test gate)
-    #   gate=<pytest target> -> CUSTOM gated task; you supply tasks/<task>/tests.patch
-    # Base: keep an existing meta.json (lets make_custom_task.sh pin a base);
-    # otherwise pin to current main HEAD.
-    mkdir -p "$TASKS_DIR/$TASK"
-    if [[ ! -f "$TASKS_DIR/$TASK/meta.json" ]]; then
-      BASE="$(git -C "$WORK_REPO" rev-parse origin/HEAD 2>/dev/null || git -C "$WORK_REPO" rev-parse HEAD)"
-      PY -c "import json;open('$TASKS_DIR/$TASK/meta.json','w').write(json.dumps({'base_sha':'$BASE','authored':True}))"
-    fi
-    if [[ "$GATE" == "MANUAL" ]]; then
-      warn "$TASK authored (open-ended) — hand/LLM scored, no test gate"
-      STATUS[$TASK]="AUTHORED"
-    elif [[ -f "$TASKS_DIR/$TASK/tests.patch" ]]; then
-      # custom gated task: verify the gate FAILS at base (no reference to check the pass side)
-      if verify_fail_at_base "$TASK" "$GATE"; then STATUS[$TASK]="CUSTOM-OK"; else STATUS[$TASK]="NEEDS-ATTENTION"; fi
-    else
-      err "$TASK has a gate but no tasks/$TASK/tests.patch — run make_custom_task.sh first"
-      STATUS[$TASK]="NO-PATCH"
-    fi
+  if [[ "$gate" == "MANUAL" ]]; then
+    warn "$task is MANUAL (open-ended, hand/LLM scored — no test gate)"
+    STATUS[$task]="MANUAL"
     continue
   fi
 
-  prep_one "$TASK" "$PR" || { STATUS[$TASK]="PREP-FAIL"; continue; }
-  if [[ "$APPLY" == "1" ]]; then
-    if verify_one "$TASK" "$GATE"; then STATUS[$TASK]="LOCKED"; else STATUS[$TASK]="NEEDS-ATTENTION"; fi
-  else
-    STATUS[$TASK]="NO-VERIFY"
+  reset_repo
+  if ! install_task_tests "$task"; then
+    err "$task has gate '$gate' but no test_*.py file in its folder"
+    STATUS[$task]="NO-TEST"; continue
   fi
+
+  # the gate should FAIL now (proves the task is real and unsolved)
+  if run_gate "$task" /dev/null; then
+    err "$task gate PASSES on untouched code — the feature/fix already exists, or the test is wrong"
+    STATUS[$task]="ALREADY-PASSES"
+  else
+    ok "$task valid (gate fails on clean code, as it should)"
+    STATUS[$task]="READY"
+  fi
+  reset_repo
 done
 
-# ---- summary -------------------------------------------------------------
-echo; echo "======================= SETUP SUMMARY ======================="
-for entry in "${TASKS[@]}"; do
-  IFS='|' read -r TASK _ _ _ <<< "$entry"
-  s="${STATUS[$TASK]:-UNKNOWN}"
-  case "$s" in
-    LOCKED)   echo "  ${c_grn}$TASK: LOCKED${c_rst}";;
-    CUSTOM-OK) echo "  ${c_grn}$TASK: custom gate OK (fails at base)${c_rst}";;
-    AUTHORED) echo "  ${c_yel}$TASK: authored (hand-scored)${c_rst}";;
-    *)        echo "  ${c_red}$TASK: $s${c_rst}";;
-  esac
-done
+# 4. summary
 echo
-echo "next:  verify model strings, then  bash run_matrix.sh --dry-run"
-echo "============================================================="
+echo "===================== SETUP SUMMARY ====================="
+for task_dir in "$TASKS_DIR"/*/; do
+  task="$(basename "$task_dir")"
+  printf "  %-26s %s\n" "$task" "${STATUS[$task]:-UNKNOWN}"
+done
+echo "next:  bash run.sh --dry-run    then    bash run.sh"
+echo "========================================================="

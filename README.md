@@ -1,78 +1,116 @@
-# cc-model-eval
+# cc-model-eval — compare two AI coding models on a real repo
 
-A small, reproducible harness for **comparing two coding-agent models head-to-head
-on real engineering tasks**, run headlessly through Claude Code (`claude -p`).
+Give two models the same coding tasks against a real codebase, run each task
+several times, and check the result with a test. No PRs, no patches — a task is
+just a folder with a prompt and a test file.
 
-It runs each model over a ladder of tasks, many times each, with a machine-checked
-success gate per task — then reports success rates plus quality (blind-judged) and token efficiency, conditioned on success (tokens, tool calls, turns). It ships configured to compare two
-Claude models on [`pallets/click`](https://github.com/pallets/click), but every
-part is configurable and it ports to any repo or private codebase.
+## Run it
 
-> **Why the ceremony?** The goal is *measurement*, not just running a model. That
-> needs three things a bare `claude -p` doesn't give you: an objective definition
-> of "done" (the gate), tasks the model couldn't have memorized (recent/private
-> code), and an identical starting state so the **only** variable between runs is
-> the model.
+    bash setup.sh            # clone the repo, make a venv, install, validate tasks
+    bash run.sh --dry-run    # see what will run
+    bash run.sh              # run every task × both models × REPS
+    python3 parse.py         # write metrics.csv (per-run metrics)
 
-## The idea in one line
+You need: `claude` (Claude Code) + Node, Python 3.10+, git. Auth via
+`ANTHROPIC_API_KEY` or a Claude subscription. Optionally set `GITHUB_TOKEN`.
 
-> **A task = a base commit + a prompt + a gate.** The model edits the code; the
-> gate (a test that's red before, green after) decides success mechanically.
+## Change what it does — edit `config.sh`
 
-## Repo layout in one line
+Open `config.sh`. Everything you change is in the **EDIT THIS** block at the top;
+the plumbing below it is internal. The three things that define an experiment:
 
-The **root is the generic harness** (scripts + docs); each concrete experiment —
-target repo, task prompts, results — lives under **`examples/<name>/`**. The shipped
-`examples/click/` is the worked example. Make your own by copying it.
+1. **The repo under test** — `REPO_URL`, `PIP_INSTALL` (keep `-e` for an editable
+   install so the model's edits are what the gate runs against), `EXTRA_PIP`
+   (e.g. `pytest`), and `TESTS_SUBDIR` (where that repo keeps its tests — `tests`,
+   `test`, `.`, etc.). `VERIFY_IMPORT` is an optional import-check.
+2. **The models** — `MODEL_A` / `MODEL_B`.
+3. **The tasks** — folders under `tasks/` (see below), not set in `config.sh`.
 
-## Quickstart
+**To retarget to another repo/stack:** edit the four repo lines in section 1.
+The bottom of the EDIT block has ready-made presets (Flask, Requests, requirements
+files, root-level tests) you can copy up. Nothing about the target repo is
+hardcoded in any script — it all comes from `config.sh`.
 
-```bash
-git clone <your-fork-url> cc-model-eval && cd cc-model-eval
-export ANTHROPIC_API_KEY=sk-ant-...   # or a Claude subscription
-export GITHUB_TOKEN=ghp_...           # avoids GitHub's 60/hr unauth limit
+## Add a task — make a folder under `tasks/`
 
-EXAMPLE=click bash setup.sh   # clone repo, venv, install, prep + verify tasks
-                              # (click is the default example; omit EXAMPLE to use it)
-bash run_matrix.sh --dry-run  # exercises setup with no model calls / no cost
-bash run_matrix.sh            # MODELS x TASKS x REPS (default 2 x 4 x 5 = 40)
-python3 parse_runs.py --runs ./runs   # -> runs/metrics.csv + summary
-```
+A task is a folder containing:
 
-## Documentation
+    tasks/my_task/
+      prompt.md     # what the model is asked to do — describe the SYMPTOM, never the fix
+      gate.txt      # pytest target(s) on one line, OR the word MANUAL
+      test_*.py     # (gated tasks) one or more test files; ALL test_*.py in the
+                    #   folder are copied into the repo's tests/ as-is
 
-| Doc | What it covers |
-|-----|----------------|
-| [docs/01-how-it-works.md](docs/01-how-it-works.md) | the mental model and a single run's lifecycle |
-| [docs/02-configuration.md](docs/02-configuration.md) | `config.sh` — where to change what |
-| [docs/03-writing-tasks.md](docs/03-writing-tasks.md) | adding tasks: **from a PR, custom/no-PR, and open-ended**; how to write gates |
-| [docs/04-porting-to-your-repo.md](docs/04-porting-to-your-repo.md) | targeting another repo or a private codebase |
-| [docs/05-judging-and-results.md](docs/05-judging-and-results.md) | reading metrics, blind LLM judging, verifying the judge |
+**Multiple tests for one task:** drop as many `test_*.py` files in the folder as
+you want — they're all copied in. In `gate.txt`, list every target the gate
+should run, space-separated on one line, e.g.:
 
-## Files
+    tests/test_choice_suggestion.py tests/test_choice_extra.py
 
-```
-config.sh           all tunables (single source of truth)
-setup.sh            clone + venv + install + prep/verify tasks
-run_matrix.sh       the experiment loop
-parse_runs.py       logs -> runs/metrics.csv + summary
-prep_task.py        PR -> (tests.patch, solution.patch, meta.json)
-make_custom_task.sh scaffold a custom (no-PR) task from a test you wrote
-lib.sh              shared helpers
-judge_prompt.md     blind LLM-judge rubric for quality scoring
-docs/               full guide (start here)
-examples/click/     a complete worked experiment (config, prompts, RESULTS.md, reviews/)
-.work/ .venv/ tasks/ runs/   generated locally (gitignored)
-```
+or target specific tests:
 
-## Requirements
+    tests/test_choice_suggestion.py::test_suggests_closest_choice_on_typo tests/test_other.py
 
-- **Claude Code** (`claude`) + **Node.js** — https://docs.claude.com/en/docs/claude-code
-- **Python 3.10+**, **git**
-- Anthropic auth: `ANTHROPIC_API_KEY` (recommended) or a Claude subscription
-- A `GITHUB_TOKEN` for PR-based task prep
-- Recommended: run inside a **container** so liberal tool permissions are sandboxed
+The gate passes only if **all** listed targets pass.
 
-## Status of the shipped example
+How it works:
+- For a **gated** task, `setup.sh` copies your `test_*.py` files into the repo and
+  checks the gate **fails** on the untouched code (proving the task is real). At run
+  time the model attempts the task, then the same gate runs again — pass/fail is the
+  result.
+- For a **MANUAL** task (`gate.txt` = `MANUAL`), there's no test; you score the
+  results by hand or with an LLM judge (see `judge_prompt.md`).
 
-The included examples/click/RESULTS.md is a worked example comparing two Claude models (one since withdrawn) at a point in time. The headline finding was that they came out roughly tied on objective gated tasks, with the only real separation on the open-ended task — where two independent judges disagreed. Treat the methodology as the reusable artifact, not the verdict; point the harness at whatever two models are available to you and re-run.
+Writing a good gated task: write a `test_*.py` that fails today because the
+feature/fix doesn't exist yet. If `setup.sh` says `ALREADY-PASSES`, the behavior
+already exists — pick something else or tighten the test.
+
+## Judge quality (beyond pass/fail)
+
+Passing a test means the code works, not that it's good. Collect the `model.diff`
+files from `runs/`, strip identities, and have an INDEPENDENT third model score
+them with `judge_prompt.md`. Then verify its load-bearing claims against the diffs.
+
+## Layout
+
+    config.sh     all settings
+    setup.sh      clone + install + validate tasks
+    run.sh        the run loop
+    parse.py      runs/ -> table
+    judge_prompt.md   blind review rubric
+    tasks/        one folder per task
+    .repo .venv runs/   generated locally
+
+## What each run saves
+
+Every run writes a folder `runs/<task>__<model>__run<N>/` containing:
+
+    run.jsonl         the model's full session (every step/tool call), stream-json
+    run.err           anything claude printed to stderr (check here first if a run breaks)
+    model.diff        the code the model changed — its actual answer
+    gate_result.txt   PASS / FAIL / MANUAL
+    gate_output.txt   the full pytest output (so you can see WHY it failed)
+
+`python3 parse.py` then rolls all runs up into **metrics.csv**, one row per run:
+model, task, run, outcome, gate_exit, num_turns, tool_calls_total,
+tool_calls_failed, files_read, files_edited, input_tokens, output_tokens,
+cache_read, cache_creation, duration_ms, num_retries, tools. (No dollar cost —
+raw token/tool usage is the fair lens for subscription runs.)
+
+## See what a model actually changed
+
+Each run saves the model's edits as `model.diff`. To read it as a diff:
+
+    cat runs/<task>__<model>__run<N>/model.diff
+
+To actually apply it to the repo and inspect/run the result yourself:
+
+    cd .repo
+    git reset --hard && git clean -fd            # start clean
+    git apply ../runs/<task>__<model>__run<N>/model.diff
+    # ...now the repo contains that run's changes. look around, run tests, etc.
+    git diff                                      # review what was applied
+    git reset --hard && git clean -fd            # undo when done
+
+This is also how you'd verify a judge's claim about a specific run: apply that
+run's diff, look at the actual code, and confirm the claim holds.
